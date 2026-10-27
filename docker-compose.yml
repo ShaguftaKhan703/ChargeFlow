@@ -1,0 +1,48 @@
+services:
+  station-service:
+    build: ./station-service
+    ports:
+      - "8001:8000"
+    environment:
+      DB_HOST: postgres
+      DB_NAME: chargeflow
+      DB_USER: chargeflow
+      DB_PASSWORD: ${DB_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  reservation-service:
+    build: ./reservation-service
+    ports:
+      - "8002:8000"
+
+  queue-service:
+    build: ./queue-service
+    ports:
+      - "8003:8000"
+    environment:
+      STATION_SERVICE_URL: http://station-service:8000
+    depends_on:
+      - station-service
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: chargeflow
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: chargeflow
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./database/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chargeflow -d chargeflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  postgres_data:
