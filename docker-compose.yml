@@ -23,8 +23,15 @@ services:
       - "8003:8000"
     environment:
       STATION_SERVICE_URL: http://station-service:8000
+      DB_HOST: postgres
+      DB_NAME: chargeflow
+      DB_USER: chargeflow
+      DB_PASSWORD: ${DB_PASSWORD}
     depends_on:
-      - station-service
+      postgres:
+        condition: service_healthy
+      station-service:
+        condition: service_started
 
   postgres:
     image: postgres:16
