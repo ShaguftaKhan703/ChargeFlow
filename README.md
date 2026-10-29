@@ -87,7 +87,27 @@ docker compose ps
 - Station Service connected to PostgreSQL.
 - Station listing and charger status updates working.
 - Queue Service communicates with Station Service.
-- Reservation and queue management logic are under development.
+- Reservation Service implemented: create, view, list, cancel, and complete reservations. Double booking is prevented by a PostgreSQL exclusion constraint.
+- Queue management logic is under development.
+
+### Reservation Service API (http://localhost:8002/docs)
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /reservations` | Create a reservation. Send `user_id`, `start_time`, `end_time` (with timezone), and either `charger_id` or `station_id` (the service picks a free charger). Returns 201, or 409 if no charger is free for that time. |
+| `GET /reservations` | List reservations; filter with `user_id`, `charger_id`, `status`. |
+| `GET /reservations/{id}` | View one reservation. |
+| `DELETE /reservations/{id}` | Cancel (safe to repeat). |
+| `PATCH /reservations/{id}/status` | Mark a reservation `completed`. |
+
+Run the tests against the running stack:
+
+```bash
+pip install pytest httpx
+pytest tests/test_reservations.py -v
+```
+
+**Note:** the seed data now includes sample users. If you have an existing database volume, reset it with `docker compose down -v` before starting again.
 
 ## Team Responsibilities
 

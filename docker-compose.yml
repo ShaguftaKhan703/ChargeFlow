@@ -16,6 +16,15 @@ services:
     build: ./reservation-service
     ports:
       - "8002:8000"
+    environment:
+      DB_HOST: postgres
+      DB_NAME: chargeflow
+      DB_USER: chargeflow
+      DB_PASSWORD: ${DB_PASSWORD}
+      STATION_SERVICE_URL: http://station-service:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   queue-service:
     build: ./queue-service
@@ -23,8 +32,18 @@ services:
       - "8003:8000"
     environment:
       STATION_SERVICE_URL: http://station-service:8000
+      RESERVATION_SERVICE_URL: http://reservation-service:8000
+      DB_HOST: postgres
+      DB_NAME: chargeflow
+      DB_USER: chargeflow
+      DB_PASSWORD: ${DB_PASSWORD}
     depends_on:
-      - station-service
+      postgres:
+        condition: service_healthy
+      station-service:
+        condition: service_started
+      reservation-service:
+        condition: service_started
 
   postgres:
     image: postgres:16
