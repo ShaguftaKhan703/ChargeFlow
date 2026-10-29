@@ -1,7 +1,7 @@
 
 import os
 import time
-
+from datetime import datetime
 import httpx
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -15,10 +15,16 @@ STATION_SERVICE_URL = os.getenv(
     "STATION_SERVICE_URL",
     "http://station-service:8000"
 )
-
+RESERVATION_SERVICE_URL = os.getenv(
+    "RESERVATION_SERVICE_URL",
+    "http://reservation-service:8000"
+)
 
 class JoinQueueRequest(BaseModel):
     user_id: int
+class AssignQueueRequest(BaseModel):
+    start_time: datetime
+    end_time: datetime
 
 
 def get_db_connection():
@@ -55,6 +61,35 @@ def call_station_service(path):
                 )
             time.sleep(0.2 * (attempt + 1))
 
+def call_reservation_service(payload):
+    try:
+        response = httpx.post(
+            f"{RESERVATION_SERVICE_URL}/reservations",
+            json=payload,
+            timeout=5.0,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in (404, 409):
+            raise HTTPException(
+                status_code=exc.response.status_code,
+                detail=exc.response.json().get(
+                    "detail", "Reservation could not be created"
+                ),
+            )
+
+        raise HTTPException(
+            status_code=503,
+            detail="Reservation Service temporarily unavailable",
+        )
+
+    except httpx.RequestError:
+        raise HTTPException(
+            status_code=503,
+            detail="Reservation Service temporarily unavailable",
+        )
 
 @app.get("/")
 def home():
@@ -249,6 +284,100 @@ def leave_queue(station_id: int, user_id: int):
             "queue_entry": dict(entry),
         }
 
+    except psycopg2.Error:
+        raise HTTPException(
+            status_code=503,
+            detail="Queue database temporarily unavailable",
+        )
+@app.post("/queues/{station_id}/assign")
+def assign_next_driver(
+    station_id: int,
+    request: AssignQueueRequest,
+):
+    """Reserve a charger for the first waiting driver."""
+    if (
+        request.start_time.tzinfo is None
+        or request.end_time.tzinfo is None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Reservation times must include a timezone",
+        )
+
+    if request.end_time <= request.start_time:
+        raise HTTPException(
+            status_code=400,
+            detail="end_time must be after start_time",
+        )
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    "SELECT station_id FROM stations WHERE station_id = %s",
+                    (station_id,),
+                )
+                if cursor.fetchone() is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Station not found",
+                    )
+
+                cursor.execute(
+                    """
+                    SELECT queue_id, user_id, station_id
+                    FROM queue_entries
+                    WHERE station_id = %s AND status = 'waiting'
+                    ORDER BY joined_at, queue_id
+                    LIMIT 1
+                    """,
+                    (station_id,),
+                )
+                entry = cursor.fetchone()
+
+        if entry is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No drivers are waiting at this station",
+            )
+
+        reservation = call_reservation_service({
+            "user_id": entry["user_id"],
+            "station_id": station_id,
+            "start_time": request.start_time.isoformat(),
+            "end_time": request.end_time.isoformat(),
+        })
+
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    UPDATE queue_entries
+                    SET status = 'assigned'
+                    WHERE queue_id = %s AND status = 'waiting'
+                    RETURNING queue_id, user_id, station_id, status
+                    """,
+                    (entry["queue_id"],),
+                )
+                updated_entry = cursor.fetchone()
+
+                if updated_entry is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Reservation was created, but the queue entry "
+                            "could not be assigned"
+                        ),
+                    )
+
+        return {
+            "message": "Reservation created for the next waiting driver",
+            "queue_entry": dict(updated_entry),
+            "reservation": reservation,
+        }
+
+    except HTTPException:
+        raise
     except psycopg2.Error:
         raise HTTPException(
             status_code=503,
