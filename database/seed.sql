@@ -18,3 +18,9 @@ WHERE name IN (
     'University Charging Station',
     'Central EV Charging Hub'
 );
+
+-- Sample drivers (needed because reservations reference users)
+
+INSERT INTO users (name, email)
+SELECT 'Driver ' || n, 'driver' || n || '@example.com'
+FROM generate_series(1, 20) AS n;
