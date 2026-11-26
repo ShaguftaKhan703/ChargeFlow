@@ -2,6 +2,7 @@
 import os
 import time
 from datetime import datetime
+
 import httpx
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -9,19 +10,25 @@ from psycopg2.errors import UniqueViolation
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+
 app = FastAPI(title="ChargeFlow Queue Service")
+
 
 STATION_SERVICE_URL = os.getenv(
     "STATION_SERVICE_URL",
     "http://station-service:8000"
 )
+
 RESERVATION_SERVICE_URL = os.getenv(
     "RESERVATION_SERVICE_URL",
     "http://reservation-service:8000"
 )
 
+
 class JoinQueueRequest(BaseModel):
     user_id: int
+
+
 class AssignQueueRequest(BaseModel):
     start_time: datetime
     end_time: datetime
@@ -59,7 +66,9 @@ def call_station_service(path):
                     status_code=503,
                     detail="Station Service temporarily unavailable",
                 )
+
             time.sleep(0.2 * (attempt + 1))
+
 
 def call_reservation_service(payload):
     try:
@@ -68,6 +77,7 @@ def call_reservation_service(payload):
             json=payload,
             timeout=5.0,
         )
+
         response.raise_for_status()
         return response.json()
 
@@ -90,6 +100,7 @@ def call_reservation_service(payload):
             status_code=503,
             detail="Reservation Service temporarily unavailable",
         )
+
 
 @app.get("/")
 def home():
@@ -122,6 +133,7 @@ def get_queues():
                     ORDER BY q.station_id, q.joined_at, q.queue_id
                     """
                 )
+
                 queues = cursor.fetchall()
 
         return {"queues": [dict(row) for row in queues]}
@@ -161,6 +173,7 @@ def get_station_queue(station_id: int):
                     "SELECT station_id FROM stations WHERE station_id = %s",
                     (station_id,),
                 )
+
                 if cursor.fetchone() is None:
                     raise HTTPException(
                         status_code=404,
@@ -184,6 +197,7 @@ def get_station_queue(station_id: int):
                     """,
                     (station_id,),
                 )
+
                 rows = cursor.fetchall()
 
         return {
@@ -211,6 +225,7 @@ def join_queue(station_id: int, request: JoinQueueRequest):
                     "SELECT station_id FROM stations WHERE station_id = %s",
                     (station_id,),
                 )
+
                 if cursor.fetchone() is None:
                     raise HTTPException(
                         status_code=404,
@@ -221,6 +236,7 @@ def join_queue(station_id: int, request: JoinQueueRequest):
                     "SELECT user_id FROM users WHERE user_id = %s",
                     (request.user_id,),
                 )
+
                 if cursor.fetchone() is None:
                     raise HTTPException(
                         status_code=404,
@@ -235,6 +251,7 @@ def join_queue(station_id: int, request: JoinQueueRequest):
                     """,
                     (request.user_id, station_id),
                 )
+
                 entry = cursor.fetchone()
 
         return {
@@ -247,6 +264,7 @@ def join_queue(station_id: int, request: JoinQueueRequest):
             status_code=409,
             detail="User is already waiting at this station",
         )
+
     except psycopg2.Error:
         raise HTTPException(
             status_code=503,
@@ -271,12 +289,16 @@ def leave_queue(station_id: int, user_id: int):
                     """,
                     (station_id, user_id),
                 )
+
                 entry = cursor.fetchone()
 
                 if entry is None:
                     raise HTTPException(
                         status_code=404,
-                        detail="No waiting queue entry found for this user at this station",
+                        detail=(
+                            "No waiting queue entry found for this user "
+                            "at this station"
+                        ),
                     )
 
         return {
@@ -289,12 +311,19 @@ def leave_queue(station_id: int, user_id: int):
             status_code=503,
             detail="Queue database temporarily unavailable",
         )
+
+
 @app.post("/queues/{station_id}/assign")
 def assign_next_driver(
     station_id: int,
     request: AssignQueueRequest,
 ):
-    """Reserve a charger for the first waiting driver."""
+    """
+    Reserve a charger for the first waiting driver.
+
+    Station-level and queue-entry row locking prevent concurrent
+    assignment requests from processing the same waiting entry.
+    """
     if (
         request.start_time.tzinfo is None
         or request.end_time.tzinfo is None
@@ -313,52 +342,67 @@ def assign_next_driver(
     try:
         with get_db_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+
+                # Lock the station row to serialize assignments
+                # for this station.
                 cursor.execute(
-                    "SELECT station_id FROM stations WHERE station_id = %s",
+                    """
+                    SELECT station_id
+                    FROM stations
+                    WHERE station_id = %s
+                    FOR UPDATE
+                    """,
                     (station_id,),
                 )
+
                 if cursor.fetchone() is None:
                     raise HTTPException(
                         status_code=404,
                         detail="Station not found",
                     )
 
+                # Select and lock the earliest waiting driver.
                 cursor.execute(
                     """
                     SELECT queue_id, user_id, station_id
                     FROM queue_entries
-                    WHERE station_id = %s AND status = 'waiting'
+                    WHERE station_id = %s
+                      AND status = 'waiting'
                     ORDER BY joined_at, queue_id
                     LIMIT 1
+                    FOR UPDATE
                     """,
                     (station_id,),
                 )
+
                 entry = cursor.fetchone()
 
-        if entry is None:
-            raise HTTPException(
-                status_code=404,
-                detail="No drivers are waiting at this station",
-            )
+                if entry is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="No drivers are waiting at this station",
+                    )
 
-        reservation = call_reservation_service({
-            "user_id": entry["user_id"],
-            "station_id": station_id,
-            "start_time": request.start_time.isoformat(),
-            "end_time": request.end_time.isoformat(),
-        })
+                # Create the reservation while holding both locks.
+                reservation = call_reservation_service({
+                    "user_id": entry["user_id"],
+                    "station_id": station_id,
+                    "start_time": request.start_time.isoformat(),
+                    "end_time": request.end_time.isoformat(),
+                })
 
-        with get_db_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                # Update the queue only after reservation succeeds.
                 cursor.execute(
                     """
                     UPDATE queue_entries
                     SET status = 'assigned'
-                    WHERE queue_id = %s AND status = 'waiting'
+                    WHERE queue_id = %s
+                      AND status = 'waiting'
                     RETURNING queue_id, user_id, station_id, status
                     """,
                     (entry["queue_id"],),
                 )
+
                 updated_entry = cursor.fetchone()
 
                 if updated_entry is None:
@@ -378,6 +422,7 @@ def assign_next_driver(
 
     except HTTPException:
         raise
+
     except psycopg2.Error:
         raise HTTPException(
             status_code=503,
